@@ -10,7 +10,6 @@ import argparse
 
 # from MyDataset import Dataset
 # import MyDataset
-
 from collections import Counter
 from typing import List, Tuple
 import datasets
@@ -152,44 +151,23 @@ class Dataset(torch.utils.data.Dataset):
         return 100*f1/len(predictions), 100*exact_match/len(predictions)
 
 
-def parse_command_line_arguments():
 
-    parser = argparse.ArgumentParser(
-        description='CLI for training T5 T2T model')
 
-    parser.add_argument('--t5_model', type=str, default="t5-base",
-                        help="What type of T5 model do you want use?")
+def prepare_squad_data(data):
+    articles = []
+    
+    for article in data["data"]:
+        for paragraph in article["paragraphs"]:
+            for qa in paragraph["qas"]:
+                question = qa["question"]
+                if not qa["is_impossible"]:
+                    answer = qa["answers"][0]["text"]
+                
+                inputs = {"context": paragraph["context"], "question": question, "answer": answer}
 
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='mini-batch size (default: 16)')
+                articles.append(inputs)
 
-    parser.add_argument('--epochs', type=int, default=40,
-                        help='number of training epochs (default: 40)')
-
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='learning rate (Adam) (default: 1e-4)')
-
-    parser.add_argument('--workers', type=int, default=10,
-                        help='number of working units used to load the data (default: 10)')
-
-    parser.add_argument('--device', default='cuda', type=str,
-                        help='device to be used for computations (in {cpu, cuda:0, cuda:1, ...}, default: cpu)')
-
-    parser.add_argument('--max_input_length', type=int, default=512,
-                        help='Maximum lenght of input text, (default: 512, maximum admitted: 512)')
-
-    parser.add_argument('--seed', type=int, default=7,
-                        help='Seed for random initialization (default: 7)')
-
-    parser.add_argument('--model_dir', type=str, default='qa_model',
-                        help='Directory where the model is saved')
-
-    parser.add_argument('--tokenizer_dir', type=str, default='qa_tokenizer',
-                        help='Directory where the tokenizer is saved')
-
-    parsed_arguments = parser.parse_args()
-
-    return parsed_arguments
+    return articles
 
 
 def train(model: T5ForConditionalGeneration, tokenizer: PreTrainedTokenizer, optimizer: AdamW, train_set: Dataset, validation_set: Dataset, num_train_epochs: int, device: str, batch_size: int, max_input_length: int = 512):
@@ -315,7 +293,12 @@ if __name__ == '__main__':
     # Set seed
     set_seed(args.seed)
 
-    _data = load_dataset("duorc", "SelfRC")
+    # Load the SQuAD dataset
+    _data = load_dataset("squad")
+
+    # Prepare the SQuAD data
+    train_data = prepare_squad_data(_data["train"])
+    validation_data = prepare_squad_data(_data["validation"])
 
     # Load the model and tokenizer from the specified directories
     model = T5ForConditionalGeneration.from_pretrained(args.model_dir)
@@ -324,10 +307,8 @@ if __name__ == '__main__':
     # creating the optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    train_set = Dataset(_data["train"], tokenizer,
-                        parser=Dataset.DatasetMap.squad)
-    validation_set = Dataset(
-        _data["validation"], tokenizer, parser=Dataset.DatasetMap.squad)
+    train_set = Dataset(train_data, tokenizer, parser=DatasetMap.squad)
+    validation_set = Dataset(validation_data, tokenizer, parser=DatasetMap.squad)
 
     train(model=model,
           tokenizer=tokenizer,
