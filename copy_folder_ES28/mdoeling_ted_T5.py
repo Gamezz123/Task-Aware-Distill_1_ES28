@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch TEDDeBERTa-v2 model."""
+""" PyTorch TEDT5 model."""
 
 from collections.abc import Sequence
 from typing import Optional, Tuple, Union
@@ -20,7 +20,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 from dataclasses import dataclass
 
 from transformers.activations import ACT2FN
@@ -29,15 +29,10 @@ from transformers.modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
 )
-
-from transformers.models.deberta_v2.modeling_deberta_v2 import (
-    DebertaV2ForQuestionAnswering,
-    DebertaV2ForSequenceClassification,
-    DebertaV2Model,
-    DebertaV2Encoder,
-    DebertaV2Layer,
-    ContextPooler,
-    StableDropout,
+from transformers.models.t5.modeling_t5 import (
+    T5ForConditionalGeneration,
+    T5PreTrainedModel,
+    T5Stack,
 )
 
 @dataclass
@@ -52,65 +47,54 @@ class TEDQuestionAnsweringModelOutput(QuestionAnsweringModelOutput):
 class TEDSequenceClassifierOutput(SequenceClassifierOutput):
     filter_states: Tuple[torch.FloatTensor] = None
 
-class TEDDebertaV2Layer(DebertaV2Layer):
+class TEDT5Layer(nn.Module):
     def __init__(self, config, layer_idx=None):
-        super().__init__(config)
+        super().__init__()
+        self.layer = T5Stack(config)
         
         assert layer_idx is not None
         self.should_add_filter = (
-            # (layer_idx < config.num_hidden_layers//2 and layer_idx % config.filter_interval == 0) 
-            # or (layer_idx >= config.num_hidden_layers//2 and layer_idx % config.filter_interval == config.filter_interval - 1)
             (layer_idx + 1) % config.filter_interval == 0
         ) and not config.filter_disabled
         
         if self.should_add_filter:
-            filter_output_dim = config.filter_output_dim if config.filter_output_dim else config.hidden_size
+            filter_output_dim = config.filter_output_dim if config.filter_output_dim else config.d_model
           
             if config.filter_nonlinear:
                 self.filter = nn.Sequential(
-                    nn.Linear(config.hidden_size, config.hidden_size), 
+                    nn.Linear(config.d_model, config.d_model), 
                     ACT2FN[config.hidden_act],
-                    nn.Linear(config.hidden_size, filter_output_dim),
+                    nn.Linear(config.d_model, filter_output_dim),
                 )
             else:
-                self.filter = nn.Linear(config.hidden_size, filter_output_dim)
+                self.filter = nn.Linear(config.d_model, filter_output_dim)
 
     def forward(
         self,
         hidden_states,
         attention_mask,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
         output_attentions=False,
     ):
-        attention_output = self.attention(
+        layer_output = self.layer(
             hidden_states,
-            attention_mask,
+            attention_mask=attention_mask,
             output_attentions=output_attentions,
-            query_states=query_states,
-            relative_pos=relative_pos,
-            rel_embeddings=rel_embeddings,
         )
-        if output_attentions:
-            attention_output, att_matrix = attention_output
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
 
         filter_layer_output = None
         if self.should_add_filter:
-            filter_layer_output = self.filter(layer_output)
+            filter_layer_output = self.filter(layer_output[0])
 
         if output_attentions:
-            return ((layer_output, filter_layer_output), att_matrix)
+            return ((layer_output[0], filter_layer_output), layer_output[1])
         else:
-            return (layer_output, filter_layer_output)
+            return (layer_output[0], filter_layer_output)
 
-class TEDDebertaV2Encoder(DebertaV2Encoder):
+class TEDT5Encoder(T5Stack):
     
     def __init__(self, config):
         super().__init__(config)
-        self.layer = nn.ModuleList([TEDDebertaV2Layer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([TEDT5Layer(config, layer_idx) for layer_idx in range(config.num_layers)])
 
     def forward(
         self,
@@ -118,33 +102,17 @@ class TEDDebertaV2Encoder(DebertaV2Encoder):
         attention_mask,
         output_hidden_states=True,
         output_attentions=False,
-        query_states=None,
-        relative_pos=None,
         return_dict=True,
     ):
-        if attention_mask.dim() <= 2:
-            input_mask = attention_mask
-        else:
-            input_mask = (attention_mask.sum(-2) > 0).byte()
-        attention_mask = self.get_attention_mask(attention_mask)
-        relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
-
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
-
-        if isinstance(hidden_states, Sequence):
-            next_kv = hidden_states[0]
-        else:
-            next_kv = hidden_states
-        rel_embeddings = self.get_rel_embedding()
-        output_states = next_kv
 
         all_filter_states = ()
         filter_states = None
 
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (output_states,)
+                all_hidden_states = all_hidden_states + (hidden_states,)
             
             if filter_states is not None:
                 all_filter_states = all_filter_states + (filter_states,)
@@ -157,152 +125,112 @@ class TEDDebertaV2Encoder(DebertaV2Encoder):
 
                     return custom_forward
 
-                output_states = torch.utils.checkpoint.checkpoint(
+                hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
-                    next_kv,
+                    hidden_states,
                     attention_mask,
-                    query_states,
-                    relative_pos,
-                    rel_embeddings,
                 )
             else:
-                output_states = layer_module(
-                    next_kv,
+                hidden_states = layer_module(
+                    hidden_states,
                     attention_mask,
-                    query_states=query_states,
-                    relative_pos=relative_pos,
-                    rel_embeddings=rel_embeddings,
                     output_attentions=output_attentions,
                 )
 
             if output_attentions:
-                output_states, att_m = output_states
+                hidden_states, att_m = hidden_states
             
-            output_states, filter_states = output_states
-
-            if i == 0 and self.conv is not None:
-                output_states = self.conv(hidden_states, output_states, input_mask)
-
-            if query_states is not None:
-                query_states = output_states
-                if isinstance(hidden_states, Sequence):
-                    next_kv = hidden_states[i + 1] if i + 1 < len(self.layer) else None
-            else:
-                next_kv = output_states
+            hidden_states, filter_states = hidden_states
 
             if output_attentions:
                 all_attentions = all_attentions + (att_m,)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (output_states,)
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if filter_states is not None:
             all_filter_states = all_filter_states + (filter_states,)
 
         if not return_dict:
             return tuple(v for v in [
-                output_states, all_hidden_states, all_attentions] if v is not None)
+                hidden_states, all_hidden_states, all_attentions] if v is not None)
         return TEDBaseModelOutput(
-            last_hidden_state=output_states,
+            last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions, 
             filter_states=all_filter_states,
         )
 
-# Copied from transformers.models.deberta.modeling_deberta.DebertaV2Model with BaseModelOutput->TEDBaseModelOutput
-class TEDDebertaV2Model(DebertaV2Model):
+class TEDT5Model(T5PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        self.encoder = TEDDebertaV2Encoder(config)
+        self.encoder = TEDT5Encoder(config)
+        self.decoder = T5Stack(config, self.shared)
 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        decoder_inputs_embeds: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                return_dict=return_dict,
+            )
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        hidden_states = encoder_outputs[0]
 
-        if attention_mask is None:
-            attention_mask = torch.ones(input_shape, device=device)
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
-
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-        )
-
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask,
-            output_hidden_states=True,
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            use_cache=use_cache,
             output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        encoded_layers = encoder_outputs[1]
-
-        if self.z_steps > 1:
-            hidden_states = encoded_layers[-2]
-            layers = [self.encoder.layer[-1] for _ in range(self.z_steps)]
-            query_states = encoded_layers[-1]
-            rel_embeddings = self.encoder.get_rel_embedding()
-            attention_mask = self.encoder.get_attention_mask(attention_mask)
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
-            for layer in layers[1:]:
-                query_states = layer(
-                    hidden_states,
-                    attention_mask,
-                    output_attentions=False,
-                    query_states=query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                )
-                encoded_layers.append(query_states)
-
-        sequence_output = encoded_layers[-1]
 
         if not return_dict:
-            return (sequence_output,) + encoder_outputs[(1 if output_hidden_states else 2) :]
+            return decoder_outputs + encoder_outputs
 
         return TEDBaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
-            attentions=encoder_outputs.attentions,
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            hidden_states=decoder_outputs.hidden_states,
+            attentions=decoder_outputs.attentions,
             filter_states=encoder_outputs.filter_states,
         )
 
-class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
+class TEDT5ForQuestionAnswering(T5ForConditionalGeneration):
 
     def __init__(self, config):
         super().__init__(config)
-        self.deberta = TEDDebertaV2Model(config)
+        self.t5 = TEDT5Model(config)
         if config.train_filters:
-            self.num_filters = config.num_hidden_layers // config.filter_interval
-            filter_output_dim = config.filter_output_dim if config.filter_output_dim else config.hidden_size
+            self.num_filters = config.num_layers // config.filter_interval
+            filter_output_dim = config.filter_output_dim if config.filter_output_dim else config.d_model
             self.filter_head = nn.ModuleList([
                 nn.Linear(filter_output_dim, config.num_labels) for _ in range(self.num_filters)
             ])
@@ -311,23 +239,20 @@ class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        start_positions: Optional[torch.Tensor] = None,
-        end_positions: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.deberta(
+        outputs = self.t5(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -335,7 +260,7 @@ class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
 
         if not self.config.train_filters:
             sequence_output = outputs[0]
-            logits = self.qa_outputs(sequence_output)
+            logits = self.lm_head(sequence_output)
             start_logits, end_logits = logits.split(1, dim=-1)
             start_logits = start_logits.squeeze(-1).contiguous()
             end_logits = end_logits.squeeze(-1).contiguous()
@@ -350,32 +275,28 @@ class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
                 filter_start_end_logits.append((filter_start_logits, filter_end_logits))
 
         total_loss = None
-        if start_positions is not None and end_positions is not None: 
+        if labels is not None: 
             # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1)
+            if len(labels.size()) > 1:
+                labels = labels.squeeze(-1)
 
             if not self.config.train_filters:
                 # sometimes the start/end positions are outside our model inputs, we ignore these terms
                 ignored_index = start_logits.size(1)
-                start_positions = start_positions.clamp(0, ignored_index)
-                end_positions = end_positions.clamp(0, ignored_index)
+                labels = labels.clamp(0, ignored_index)
                 loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-                start_loss = loss_fct(start_logits, start_positions)
-                end_loss = loss_fct(end_logits, end_positions)
+                start_loss = loss_fct(start_logits, labels)
+                end_loss = loss_fct(end_logits, labels)
                 total_loss = (start_loss + end_loss) / 2
             else:
                 total_loss = 0.0
                 for filter_start_logits, filter_end_logits in filter_start_end_logits:
                     # sometimes the start/end positions are outside our model inputs, we ignore these terms
                     ignored_index = filter_start_logits.size(1)
-                    _start_positions = start_positions.clamp(0, ignored_index)
-                    _end_positions = end_positions.clamp(0, ignored_index)
+                    _labels = labels.clamp(0, ignored_index)
                     loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-                    start_loss = loss_fct(filter_start_logits, _start_positions)
-                    end_loss = loss_fct(filter_end_logits, _end_positions)
+                    start_loss = loss_fct(filter_start_logits, _labels)
+                    end_loss = loss_fct(filter_end_logits, _labels)
                     total_loss += (start_loss + end_loss) / 2
                 total_loss /= self.num_filters
 
@@ -392,62 +313,54 @@ class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
             filter_states=outputs.filter_states,
         )
 
-class TEDContextPooler(ContextPooler):
+class TEDContextPooler(nn.Module):
     def __init__(self, config):
-        super().__init__(config)
-        pooler_output_dim = self.config.filter_output_dim if self.config.filter_output_dim is not None else self.config.pooler_hidden_size
+        super().__init__()
+        pooler_output_dim = config.filter_output_dim if config.filter_output_dim is not None else config.d_model
         self.dense = nn.Linear(pooler_output_dim, pooler_output_dim)
     
     @property
     def output_dim(self):
-        return self.config.filter_output_dim if self.config.filter_output_dim is not None else self.config.hidden_size
+        return self.config.filter_output_dim if self.config.filter_output_dim is not None else self.config.d_model
 
-class TEDDebertaV2ForSequenceClassification(DebertaV2ForSequenceClassification):
+class TEDT5ForSequenceClassification(T5ForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
 
-        self.deberta = TEDDebertaV2Model(config)
+        self.t5 = TEDT5Model(config)
         if config.train_filters:
-            self.num_filters = config.num_hidden_layers // config.filter_interval
+            self.num_filters = config.num_layers // config.filter_interval
             self.filter_pooler = nn.ModuleList([
                 TEDContextPooler(config) for _ in range(self.num_filters)
             ])
             filter_output_dim = self.filter_pooler[0].output_dim
             self.filter_head = nn.ModuleList([
-                nn.Linear(filter_output_dim, self.num_labels) for _ in range(self.num_filters)
+                nn.Linear(filter_output_dim, config.num_labels) for _ in range(self.num_filters)
             ])
             drop_out = getattr(config, "cls_dropout", None)
-            drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
+            drop_out = config.hidden_dropout_prob if drop_out is None else drop_out
             self.filter_dropout = nn.ModuleList([
-                StableDropout(drop_out) for _ in range(self.num_filters)
+                nn.Dropout(drop_out) for _ in range(self.num_filters)
             ])
 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.deberta(
+        outputs = self.t5(
             input_ids,
-            token_type_ids=token_type_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
