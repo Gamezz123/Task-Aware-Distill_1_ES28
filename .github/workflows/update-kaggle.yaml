@@ -1,0 +1,34 @@
+name: Update Kaggle Dataset
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update-dataset:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install Kaggle API
+      run: pip install kaggle
+
+    - name: Configure Kaggle API
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      run: |
+        mkdir -p ~/.kaggle
+        echo "{\"username\":\"${KAGGLE_USERNAME}\",\"key\":\"${KAGGLE_KEY}\"}" > ~/.kaggle/kaggle.json
+        chmod 600 ~/.kaggle/kaggle.json
+
+    - name: Upload to Kaggle
+      run: |
+        kaggle datasets version -p . -m "Automated update from GitHub" --dir-mode tar
