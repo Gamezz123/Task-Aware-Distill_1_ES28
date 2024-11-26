@@ -54,9 +54,7 @@ def prepare_squad_data(data):
         for answer in answers:
             inputs = {"context": context, "question": question, "answer": answer}
             articles.append(inputs)
-
     return articles
-
 
 def collate_fn(batch, tokenizer, max_input_length=512):
     contexts = [item["context"] for item in batch]
@@ -109,13 +107,10 @@ def train(model: T5ForConditionalGeneration, tokenizer: PreTrainedTokenizer, opt
                                         num_workers=args.workers, collate_fn=lambda batch: collate_fn(batch, tokenizer, max_input_length))
     my_validation_dataloader = DataLoader(validation_set, batch_size=batch_size,
                                           num_workers=args.workers, collate_fn=lambda batch: collate_fn(batch, tokenizer, max_input_length))
-
     # set training mode on the model
     model.train()
-
     # model to device
     model.to(device)
-
     f1_old: int = 0
     for epoch in range(num_train_epochs):
         epoch_train_loss = 0.
@@ -133,7 +128,6 @@ def train(model: T5ForConditionalGeneration, tokenizer: PreTrainedTokenizer, opt
             epoch_train_loss += loss.item() * batch_size
         print(f"epoch={epoch + 1}/{num_train_epochs}")
         print(f"\t Train loss = {epoch_train_loss / len(train_set):.4f}")
-
         model.eval()
         with torch.no_grad():
             model_predictions_encoded = []
@@ -142,14 +136,11 @@ def train(model: T5ForConditionalGeneration, tokenizer: PreTrainedTokenizer, opt
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
-
                 model_predictions = model.generate(
                     input_ids=input_ids, attention_mask=attention_mask)
-
                 model_predictions_encoded += model_predictions.tolist()
                 target_encoded += labels.tolist()
             f1, exact_match = evaluate(model_predictions_encoded, target_encoded, tokenizer)
-
             print(f"\t Validation F1 = {f1:.2f}, EM = {exact_match:.2f}")
             if f1 > f1_old:
                 model.save_pretrained(f'results/{model.name_or_path}/model/best-f1')
@@ -164,7 +155,6 @@ def train(model: T5ForConditionalGeneration, tokenizer: PreTrainedTokenizer, opt
         f'results/{model.name_or_path}/model/checkpoint-{epoch + 1}')
     tokenizer.save_pretrained(
         f'results/{model.name_or_path}/tokenizer/checkpoint-{epoch + 1}')
-
 
 def evaluate(predictions, targets, tokenizer):
     decoded_predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
@@ -224,4 +214,6 @@ if __name__ == '__main__':
           optimizer=optimizer,
           train_set=train_data,
           validation_set=validation_data,
-          num_train_epochs=args.epochs, device=args.device, batch_size=args.batch_size)
+          num_train_epochs=args.epochs, device=args.device, batch_size=args.batch_size)    
+    
+    
